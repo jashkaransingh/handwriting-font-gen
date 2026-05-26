@@ -1,90 +1,160 @@
+"""
+Training script for the handwriting character recognition CNN.
+
+Reads the .npz files written by data/synthesize.py, trains a CNN with on-the-fly
+augmentation, validates each epoch, and saves the best checkpoint by validation
+accuracy.
+
+Designed to run on CPU in reasonable time. With samples_per_class=400 and 5
+epochs, total time is roughly 5 to 10 minutes on a modern CPU.
+"""
+
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from torchvision import datasets, transforms
-import argparse
-import os
-from model import HandwritingCNN
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from data.augment import AugmentationPipeline
+from data.dataset import HandwritingDataset, load_classes
+from models.cnn import HandwritingCNN
 
 
-def train(data_dir, epochs, output_dir, lr=1e-3, batch_size=64):
+def evaluate(model, loader, device, criterion):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item() * images.size(0)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += images.size(0)
+    return total_loss / total, correct / total
+
+
+def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"device: {device}")
 
-    transform = transforms.Compose([
-        transforms.Grayscale(),
-        transforms.Resize((64, 64)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5], std=[0.5]),
-    ])
+    train_aug = AugmentationPipeline(severity="light", seed=args.seed)
 
-    full_dataset = datasets.ImageFolder(data_dir, transform=transform)
-    num_classes = len(full_dataset.classes)
-    print(f"Classes: {full_dataset.classes}")
+    train_ds = HandwritingDataset(
+        Path(args.data_dir) / "train.npz", augment=train_aug)
+    val_ds = HandwritingDataset(
+        Path(args.data_dir) / "val.npz", augment=None)
+    classes = load_classes(args.data_dir)
 
-    val_size = int(0.15 * len(full_dataset))
-    train_size = len(full_dataset) - val_size
-    train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
+    print(f"train: {len(train_ds)} samples, val: {len(val_ds)} samples, "
+          f"{len(classes)} classes")
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=2)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=True, num_workers=args.workers,
+                              pin_memory=False)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size,
+                            shuffle=False, num_workers=args.workers,
+                            pin_memory=False)
 
-    model = HandwritingCNN(num_classes=num_classes).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    model = HandwritingCNN(num_classes=len(classes)).to(device)
+    print(f"model params: {model.count_params():,}")
+
     criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr,
+                            weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs)
 
-    best_val_acc = 0.0
-    os.makedirs(output_dir, exist_ok=True)
+    ckpt_dir = Path(args.checkpoint_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, epochs + 1):
+    best_acc = 0.0
+    history = []
+    start = time.time()
+
+    for epoch in range(1, args.epochs + 1):
         model.train()
-        total_loss = 0
+        running_loss = 0.0
+        correct = 0
+        total = 0
 
-        for imgs, labels in train_loader:
-            imgs, labels = imgs.to(device), labels.to(device)
+        pbar = tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}",
+                    leave=False)
+        for images, labels in pbar:
+            images = images.to(device)
+            labels = labels.to(device)
+
             optimizer.zero_grad()
-            out = model(imgs)
-            loss = criterion(out, labels)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
 
-        # Validation
-        model.eval()
-        correct = 0
-        with torch.no_grad():
-            for imgs, labels in val_loader:
-                imgs, labels = imgs.to(device), labels.to(device)
-                preds = model(imgs).argmax(dim=1)
-                correct += (preds == labels).sum().item()
+            running_loss += loss.item() * images.size(0)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += images.size(0)
+            pbar.set_postfix(loss=f"{running_loss / total:.4f}",
+                             acc=f"{correct / total:.3f}")
 
-        val_acc = correct / len(val_ds)
         scheduler.step()
 
-        print(f"Epoch {epoch:3d}/{epochs} | Loss: {total_loss/len(train_loader):.4f} | Val Acc: {val_acc:.4f}")
+        train_loss = running_loss / total
+        train_acc = correct / total
+        val_loss, val_acc = evaluate(model, val_loader, device, criterion)
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            ckpt = {
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "classes": full_dataset.classes,
+        elapsed = time.time() - start
+        print(f"epoch {epoch}/{args.epochs}  "
+              f"train_loss={train_loss:.4f} train_acc={train_acc:.3f}  "
+              f"val_loss={val_loss:.4f} val_acc={val_acc:.3f}  "
+              f"({elapsed:.1f}s elapsed)")
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+        })
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "classes": classes,
                 "val_acc": val_acc,
-            }
-            torch.save(ckpt, os.path.join(output_dir, "best.pth"))
-            print(f"  → Saved best model (val_acc={val_acc:.4f})")
+                "epoch": epoch,
+            }, ckpt_dir / "best.pth")
+            print(f"  saved best checkpoint, val_acc={val_acc:.3f}")
 
-    print(f"\nDone. Best val accuracy: {best_val_acc:.4f}")
+    print(f"\ntraining complete in {time.time() - start:.1f}s")
+    print(f"best val_acc: {best_acc:.3f}")
+
+    import json
+    with open(ckpt_dir / "history.json", "w") as f:
+        json.dump(history, f, indent=2)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", required=True)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--data-dir", default="data/synthetic")
+    parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    train(args.data, args.epochs, args.output, args.lr, args.batch_size)
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    train(args)
