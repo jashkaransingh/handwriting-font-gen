@@ -1,0 +1,7 @@
+checkpoints/
+*.pth
+__pycache__/
+raw/
+processed/
+labeled/
+.DS_Store
